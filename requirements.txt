@@ -7,5 +7,5 @@ torchvision
 Pillow
 transformers
 opencv-python-headless
-mobile-sam
 timm
+git+https://github.com/ChaoningZhang/MobileSAM.git
