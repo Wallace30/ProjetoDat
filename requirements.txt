@@ -7,3 +7,5 @@ torchvision
 Pillow
 transformers
 opencv-python-headless
+mobile-sam
+timm
