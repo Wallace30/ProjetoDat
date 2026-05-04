@@ -17,18 +17,18 @@ st.set_page_config(page_title="SAM + MiniViT — Grãos de Café", layout="wide"
 st.title("☕ Segmentação + Classificação de Grãos")
 st.markdown("**MobileSAM** segmenta · **MiniViT** classifica o estádio de cada grão")
 
-# ── Cores por estádio ─────────────────────────────────────
+# ── Cores por estádio (atualizadas para suas 5 classes) ───
 CORES_ESTADIO = {
-    "cereja": (40,  40, 200),
-    "cana":   (20, 160, 180),
-    "verde":  (34, 158,  34),
-    "passa":  (128, 30, 128),
-    "boia":   (80,  80,  80),
+    "Verde":      (34,  158,  34),   # verde
+    "Cana":       (20,  160, 180),   # amarelo-esverdeado
+    "Cereja":     (40,   40, 200),   # vermelho
+    "Seco":       (80,   50,  20),   # marrom escuro
+    "Cerscospera":(128,  30, 128),   # roxo (doença)
 }
 
 # ── Cache dos modelos ─────────────────────────────────────
 @st.cache_resource
-def carregar_sam():
+def carregar_sam_normal():
     from mobile_sam import sam_model_registry, SamAutomaticMaskGenerator
     sam = sam_model_registry["vit_t"](checkpoint="mobile_sam.pt")
     return SamAutomaticMaskGenerator(
@@ -43,11 +43,26 @@ def carregar_sam():
     )
 
 @st.cache_resource
-def carregar_minivit():
-    caminho = "minivit-custom-graos19"
+def carregar_sam_verde():
+    from mobile_sam import sam_model_registry, SamAutomaticMaskGenerator
+    sam = sam_model_registry["vit_t"](checkpoint="mobile_sam.pt")
+    return SamAutomaticMaskGenerator(
+        model=sam,
+        points_per_batch=32,
+        points_per_side=48,
+        pred_iou_thresh=0.75,
+        stability_score_thresh=0.80,
+        box_nms_thresh=0.25,
+        min_mask_region_area=200,
+        crop_n_layers=1,
+        crop_overlap_ratio=0.5,
+    )
 
-    # Instancia direto sem depender do preprocessor_config.json
-    # Parâmetros idênticos ao treino: size=64, mean/std=0.5
+@st.cache_resource
+def carregar_minivit():
+    # ── Atualize aqui para o nome da sua pasta do novo modelo ──
+    caminho = "minivit-custom-graos21"
+
     processor = ViTImageProcessor(
         do_resize=True,
         size={"height": 64, "width": 64},
@@ -55,7 +70,6 @@ def carregar_minivit():
         image_mean=[0.5, 0.5, 0.5],
         image_std=[0.5, 0.5, 0.5],
     )
-
     modelo = ViTForImageClassification.from_pretrained(
         caminho,
         ignore_mismatched_sizes=True,
@@ -63,23 +77,31 @@ def carregar_minivit():
     modelo.eval()
     return processor, modelo
 
-generator             = carregar_sam()
 vit_processor, vit_model = carregar_minivit()
+
+
+# ── Detecta tipo de foto automaticamente ─────────────────
+def detectar_tipo_foto(imagem_bgr):
+    hsv = cv2.cvtColor(imagem_bgr, cv2.COLOR_BGR2HSV)
+    mask_fundo = cv2.inRange(hsv, np.array([0, 0, 185]), np.array([180, 40, 255]))
+    mask_graos = cv2.bitwise_not(mask_fundo)
+    pixels = hsv[mask_graos > 0]
+    if len(pixels) == 0:
+        return "normal"
+    hue = pixels[:, 0]
+    pct_verde = ((hue >= 35) & (hue <= 85)).sum() / len(hue)
+    return "verde" if pct_verde > 0.35 else "normal"
 
 
 # ── Classificação ─────────────────────────────────────────
 def classificar_grao(recorte_bgr, processor, modelo):
     pil_img = Image.fromarray(cv2.cvtColor(recorte_bgr, cv2.COLOR_BGR2RGB))
     inputs  = processor(images=pil_img, return_tensors="pt")
-
     with torch.no_grad():
         logits = modelo(**inputs).logits
-
     probs     = torch.softmax(logits, dim=-1)[0]
     idx       = probs.argmax().item()
     confianca = probs[idx].item()
-
-    # id2label vem direto do config.json salvo no treino
     label = modelo.config.id2label.get(idx, str(idx))
     return label, round(confianca, 3)
 
@@ -166,6 +188,11 @@ if arquivo:
         escala = 800 / max(H, W)
         img = cv2.resize(img, (int(W*escala), int(H*escala)))
 
+    # ── Detecta tipo e carrega SAM adequado ──────────────
+    tipo_foto = detectar_tipo_foto(img)
+    generator = carregar_sam_verde() if tipo_foto == "verde" else carregar_sam_normal()
+    st.info(f"Modo detectado: **{tipo_foto}** — parâmetros otimizados ativos")
+
     # ── SAM segmenta ─────────────────────────────────────
     with st.spinner("SAM segmentando..."):
         mask_hsv     = remover_fundo_branco(img)
@@ -212,7 +239,6 @@ if arquivo:
         g["confianca"] = conf
         g["recorte"]   = recorte
         contagem[label] = contagem.get(label, 0) + 1
-
         progresso.progress(
             (i+1) / len(graos_finais),
             text=f"Classificando {i+1}/{len(graos_finais)}...",
@@ -223,7 +249,7 @@ if arquivo:
 
     # ── Debug colorido por estádio ────────────────────────
     debug = img.copy()
-    for i, g in enumerate(graos_finais):
+    for g in graos_finais:
         bx, by, bw, bh = [int(v) for v in g["bbox"]]
         cor = CORES_ESTADIO.get(g["label"], (100, 100, 100))
         cv2.rectangle(debug, (bx, by), (bx+bw, by+bh), cor, 2)
@@ -233,18 +259,21 @@ if arquivo:
 
     # ── Métricas ──────────────────────────────────────────
     st.success(f"✓ {total} grãos classificados!")
-
-    # Porcentagens por estádio
     st.subheader("Porcentagem por estádio")
-    classes_encontradas = sorted(contagem.keys())
+
+    # Ordena pela ordem natural das classes
+    ORDEM_CLASSES = ["Verde", "Cana", "Cereja", "Seco", "Cerscospera"]
+    classes_encontradas = [c for c in ORDEM_CLASSES if c in contagem]
+    # Adiciona qualquer classe inesperada do modelo no final
+    for c in contagem:
+        if c not in classes_encontradas:
+            classes_encontradas.append(c)
+
     cols = st.columns(len(classes_encontradas))
     for col, cls in zip(cols, classes_encontradas):
         pct = contagem[cls] / total * 100
-        col.metric(label=cls.capitalize(),
-                   value=f"{pct:.1f}%",
-                   delta=f"{contagem[cls]} grãos")
+        col.metric(label=cls, value=f"{pct:.1f}%", delta=f"{contagem[cls]} grãos")
 
-    # Imagens lado a lado
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Original")
@@ -265,7 +294,8 @@ if arquivo:
     st.subheader("Recortes por estádio")
     for cls in classes_encontradas:
         graos_cls = [g for g in graos_finais if g["label"] == cls]
-        with st.expander(f"{cls.capitalize()} — {len(graos_cls)} grãos ({len(graos_cls)/total*100:.1f}%)"):
+        pct = len(graos_cls) / total * 100
+        with st.expander(f"{cls} — {len(graos_cls)} grãos ({pct:.1f}%)"):
             n_mostrar = min(12, len(graos_cls))
             cols_rec  = st.columns(n_mostrar)
             for col, g in zip(cols_rec, graos_cls[:n_mostrar]):
